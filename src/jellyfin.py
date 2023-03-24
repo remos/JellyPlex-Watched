@@ -13,6 +13,8 @@ from src.watched import (
     combine_watched_dicts,
 )
 
+JELLYFIN_TICKS = 10_000
+
 
 def get_movie_guids(movie):
     if "ProviderIds" in movie:
@@ -42,7 +44,7 @@ def get_movie_guids(movie):
     movie_guids["status"] = {
         "completed": movie["UserData"]["Played"],
         # Convert ticks to milliseconds to match Plex
-        "time": floor(movie["UserData"]["PlaybackPositionTicks"] / 10000),
+        "time": floor(movie["UserData"]["PlaybackPositionTicks"] / JELLYFIN_TICKS),
     }
 
     return movie_guids
@@ -58,7 +60,7 @@ def get_episode_guids(episode):
 
     episode_dict["status"] = {
         "completed": episode["UserData"]["Played"],
-        "time": floor(episode["UserData"]["PlaybackPositionTicks"] / 10000),
+        "time": floor(episode["UserData"]["PlaybackPositionTicks"] / JELLYFIN_TICKS),
     }
 
     return episode_dict
@@ -77,7 +79,9 @@ class Jellyfin:
 
         self.users = asyncio.run(self.get_users())
 
-    async def query(self, query, query_type, session, identifiers=None):
+    async def query(
+        self, query, query_type, session, identifiers=None, no_results=False
+    ):
         try:
             results = None
             headers = {"Accept": "application/json", "X-Emby-Token": self.token}
@@ -98,6 +102,11 @@ class Jellyfin:
                         raise Exception(
                             f"Query failed with status {response.status} {response.reason}"
                         )
+
+                    # If no results are expected, return None
+                    if no_results:
+                        return None
+
                     results = await response.json()
 
             elif query_type == "post":
@@ -108,6 +117,26 @@ class Jellyfin:
                         raise Exception(
                             f"Query failed with status {response.status} {response.reason}"
                         )
+
+                    # If no results are expected, return None
+                    if no_results:
+                        return None
+
+                    results = await response.json()
+
+            elif query_type == "delete":
+                async with session.delete(
+                    self.baseurl + query, headers=headers
+                ) as response:
+                    if response.status not in [200, 204]:
+                        raise Exception(
+                            f"Query failed with status {response.status} {response.reason}"
+                        )
+
+                    # If no results are expected, return None
+                    if no_results:
+                        return None
+
                     results = await response.json()
 
             if not isinstance(results, list) and not isinstance(results, dict):
@@ -594,7 +623,7 @@ class Jellyfin:
                                 jellyfin_video_id = jellyfin_video["Id"]
                                 msg = f"{jellyfin_video['Name']} as watched for {user_name} in {library} for Jellyfin"
                                 if not dryrun:
-                                    logger(f"Marking {msg}", 0)
+                                    logger(f"Marked {msg}", 0)
                                     await self.query(
                                         f"/Users/{user_id}/PlayedItems/{jellyfin_video_id}",
                                         "post",
@@ -603,11 +632,16 @@ class Jellyfin:
                                 else:
                                     logger(f"Dryrun {msg}", 0)
                             else:
-                                # TODO add support for partially watched movies
                                 jellyfin_video_id = jellyfin_video["Id"]
                                 msg = f"{jellyfin_video['Name']} as partially watched for {floor(movie_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
                                 if not dryrun:
-                                    logger(f"Marking {msg}", 0)
+                                    logger(f"Marked {msg}", 0)
+                                    await self.query(
+                                        f"/Users/{user_id}/PlayingItems/{jellyfin_video_id}?positionTicks={movie_status['time']*JELLYFIN_TICKS}",
+                                        "delete",
+                                        session,
+                                        no_results=True,
+                                    )
                                 else:
                                     logger(f"Dryrun {msg}", 0)
                         else:
@@ -736,8 +770,8 @@ class Jellyfin:
                                                 break
 
                                 if episode_status:
+                                    jellyfin_episode_id = jellyfin_episode["Id"]
                                     if episode_status["completed"]:
-                                        jellyfin_episode_id = jellyfin_episode["Id"]
                                         msg = (
                                             f"{jellyfin_episode['SeriesName']} {jellyfin_episode['SeasonName']} Episode {jellyfin_episode['IndexNumber']} {jellyfin_episode['Name']}"
                                             + f" as watched for {user_name} in {library} for Jellyfin"
@@ -752,16 +786,21 @@ class Jellyfin:
                                         else:
                                             logger(f"Dryrun {msg}", 0)
                                     else:
-                                        # TODO add support for partially watched episodes
-                                        jellyfin_episode_id = jellyfin_episode["Id"]
                                         msg = (
                                             f"{jellyfin_episode['SeriesName']} {jellyfin_episode['SeasonName']} Episode {jellyfin_episode['IndexNumber']} {jellyfin_episode['Name']}"
                                             + f" as partially watched for {floor(episode_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
                                         )
                                         if not dryrun:
                                             logger(f"Marked {msg}", 0)
+                                            await self.query(
+                                                f"/Users/{user_id}/PlayingItems/{jellyfin_episode_id}?positionTicks={episode_status['time']*JELLYFIN_TICKS}",
+                                                "delete",
+                                                session,
+                                                no_results=True,
+                                            )
                                         else:
                                             logger(f"Dryrun {msg}", 0)
+
                                 else:
                                     logger(
                                         f"Jellyfin: Skipping episode {jellyfin_episode['Name']} as it is not in mark list for {user_name}",
