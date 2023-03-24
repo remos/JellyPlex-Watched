@@ -79,9 +79,7 @@ class Jellyfin:
 
         self.users = asyncio.run(self.get_users())
 
-    async def query(
-        self, query, query_type, session, identifiers=None, no_results=False
-    ):
+    async def query(self, query, query_type, session, identifiers=None):
         try:
             results = None
             headers = {"Accept": "application/json", "X-Emby-Token": self.token}
@@ -103,8 +101,7 @@ class Jellyfin:
                             f"Query failed with status {response.status} {response.reason}"
                         )
 
-                    # If no results are expected, return None
-                    if no_results:
+                    if response.status == 204:
                         return None
 
                     results = await response.json()
@@ -113,13 +110,12 @@ class Jellyfin:
                 async with session.post(
                     self.baseurl + query, headers=headers
                 ) as response:
-                    if response.status != 200:
+                    if response.status not in [200, 204]:
                         raise Exception(
                             f"Query failed with status {response.status} {response.reason}"
                         )
 
-                    # If no results are expected, return None
-                    if no_results:
+                    if response.status == 204:
                         return None
 
                     results = await response.json()
@@ -133,8 +129,7 @@ class Jellyfin:
                             f"Query failed with status {response.status} {response.reason}"
                         )
 
-                    # If no results are expected, return None
-                    if no_results:
+                    if response.status == 204:
                         return None
 
                     results = await response.json()
@@ -640,7 +635,6 @@ class Jellyfin:
                                         f"/Users/{user_id}/PlayingItems/{jellyfin_video_id}?positionTicks={movie_status['time']*JELLYFIN_TICKS}",
                                         "delete",
                                         session,
-                                        no_results=True,
                                     )
                                 else:
                                     logger(f"Dryrun {msg}", 0)
@@ -796,7 +790,6 @@ class Jellyfin:
                                                 f"/Users/{user_id}/PlayingItems/{jellyfin_episode_id}?positionTicks={episode_status['time']*JELLYFIN_TICKS}",
                                                 "delete",
                                                 session,
-                                                no_results=True,
                                             )
                                         else:
                                             logger(f"Dryrun {msg}", 0)
