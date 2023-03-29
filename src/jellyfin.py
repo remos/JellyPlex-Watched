@@ -79,22 +79,21 @@ class Jellyfin:
 
         self.users = asyncio.run(self.get_users())
 
-    async def query(self, query, query_type, session, identifiers=None):
+    async def query(self, query, query_type, session, identifiers=None, data=None):
         try:
             results = None
             headers = {"Accept": "application/json", "X-Emby-Token": self.token}
-            authorization = (
+            headers["X-Emby-Authorization"] = (
                 "MediaBrowser , "
-                'Client="other", '
+                'Client="JellyPlex-Watched", '
                 'Device="script", '
                 'DeviceId="script", '
-                'Version="0.0.0"'
+                'Version="5.0.0" '
             )
-            headers["X-Emby-Authorization"] = authorization
 
             if query_type == "get":
                 async with session.get(
-                    self.baseurl + query, headers=headers
+                    self.baseurl + query, headers=headers, json=data
                 ) as response:
                     if response.status != 200:
                         raise Exception(
@@ -108,7 +107,7 @@ class Jellyfin:
 
             elif query_type == "post":
                 async with session.post(
-                    self.baseurl + query, headers=headers
+                    self.baseurl + query, headers=headers, json=data
                 ) as response:
                     if response.status not in [200, 204]:
                         raise Exception(
@@ -122,7 +121,7 @@ class Jellyfin:
 
             elif query_type == "delete":
                 async with session.delete(
-                    self.baseurl + query, headers=headers
+                    self.baseurl + query, headers=headers, json=data
                 ) as response:
                     if response.status not in [200, 204]:
                         raise Exception(
@@ -573,7 +572,7 @@ class Jellyfin:
                         session,
                     )
                     for jellyfin_video in jellyfin_search["Items"]:
-                        movie_status = None
+                        video_status = None
 
                         if "MediaSources" in jellyfin_video:
                             for movie_location in jellyfin_video["MediaSources"]:
@@ -586,11 +585,11 @@ class Jellyfin:
                                             movie_location["Path"].split("/")[-1]
                                             in video["locations"]
                                         ):
-                                            movie_status = video["status"]
+                                            video_status = video["status"]
                                             break
                                     break
 
-                        if not movie_status:
+                        if not video_status:
                             for (
                                 movie_provider_source,
                                 movie_provider_id,
@@ -609,13 +608,13 @@ class Jellyfin:
                                                     movie_provider_source.lower()
                                                 ]
                                             ):
-                                                movie_status = video["status"]
+                                                video_status = video["status"]
                                                 break
                                         break
 
-                        if movie_status:
-                            if movie_status["completed"]:
-                                jellyfin_video_id = jellyfin_video["Id"]
+                        if video_status:
+                            jellyfin_video_id = jellyfin_video["Id"]
+                            if video_status["completed"]:
                                 msg = f"{jellyfin_video['Name']} as watched for {user_name} in {library} for Jellyfin"
                                 if not dryrun:
                                     logger(f"Marked {msg}", 0)
@@ -627,12 +626,11 @@ class Jellyfin:
                                 else:
                                     logger(f"Dryrun {msg}", 0)
                             else:
-                                jellyfin_video_id = jellyfin_video["Id"]
-                                msg = f"{jellyfin_video['Name']} as partially watched for {floor(movie_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
+                                msg = f"{jellyfin_video['Name']} as partially watched for {floor(video_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
                                 if not dryrun:
                                     logger(f"Marked {msg}", 0)
                                     await self.query(
-                                        f"/Users/{user_id}/PlayingItems/{jellyfin_video_id}?positionTicks={movie_status['time']*JELLYFIN_TICKS}",
+                                        f"/Users/{user_id}/PlayingItems/{jellyfin_video_id}?positionTicks={video_status['time']*JELLYFIN_TICKS}",
                                         "delete",
                                         session,
                                     )
@@ -714,7 +712,7 @@ class Jellyfin:
                             )
 
                             for jellyfin_episode in jellyfin_episodes["Items"]:
-                                episode_status = None
+                                video_status = None
 
                                 if "MediaSources" in jellyfin_episode:
                                     for episode_location in jellyfin_episode[
@@ -731,11 +729,11 @@ class Jellyfin:
                                                     ]
                                                     in episode["locations"]
                                                 ):
-                                                    episode_status = episode["status"]
+                                                    video_status = episode["status"]
                                                     break
                                             break
 
-                                if not episode_status:
+                                if not video_status:
                                     for (
                                         episode_provider_source,
                                         episode_provider_id,
@@ -757,15 +755,13 @@ class Jellyfin:
                                                             episode_provider_source.lower()
                                                         ]
                                                     ):
-                                                        episode_status = episode[
-                                                            "status"
-                                                        ]
+                                                        video_status = episode["status"]
                                                         break
                                                 break
 
-                                if episode_status:
-                                    jellyfin_episode_id = jellyfin_episode["Id"]
-                                    if episode_status["completed"]:
+                                if video_status:
+                                    jellyfin_video_id = jellyfin_episode["Id"]
+                                    if video_status["completed"]:
                                         msg = (
                                             f"{jellyfin_episode['SeriesName']} {jellyfin_episode['SeasonName']} Episode {jellyfin_episode['IndexNumber']} {jellyfin_episode['Name']}"
                                             + f" as watched for {user_name} in {library} for Jellyfin"
@@ -773,7 +769,7 @@ class Jellyfin:
                                         if not dryrun:
                                             logger(f"Marked {msg}", 0)
                                             await self.query(
-                                                f"/Users/{user_id}/PlayedItems/{jellyfin_episode_id}",
+                                                f"/Users/{user_id}/PlayedItems/{jellyfin_video_id}",
                                                 "post",
                                                 session,
                                             )
@@ -782,12 +778,12 @@ class Jellyfin:
                                     else:
                                         msg = (
                                             f"{jellyfin_episode['SeriesName']} {jellyfin_episode['SeasonName']} Episode {jellyfin_episode['IndexNumber']} {jellyfin_episode['Name']}"
-                                            + f" as partially watched for {floor(episode_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
+                                            + f" as partially watched for {floor(video_status['time'] / 60_000)} minutes for {user_name} in {library} for Jellyfin"
                                         )
                                         if not dryrun:
                                             logger(f"Marked {msg}", 0)
                                             await self.query(
-                                                f"/Users/{user_id}/PlayingItems/{jellyfin_episode_id}?positionTicks={episode_status['time']*JELLYFIN_TICKS}",
+                                                f"/Users/{user_id}/PlayingItems/{jellyfin_video_id}?positionTicks={video_status['time']*JELLYFIN_TICKS}",
                                                 "delete",
                                                 session,
                                             )
