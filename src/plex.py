@@ -1,4 +1,4 @@
-import re, requests, os, traceback
+import re, requests, os, traceback, asyncio
 from typing import Dict, Union, FrozenSet
 import operator
 from itertools import groupby as itertools_groupby
@@ -37,7 +37,7 @@ class HostNameIgnoringAdapter(RequestsHTTPAdapter):
         )
 
 
-def extract_guids_from_item(item: Union[Movie, Episode]) -> Dict[str, str]:
+async def extract_guids_from_item(item: Union[Movie, Episode]) -> Dict[str, str]:
     guids: Dict[str, str] = dict(
         guid.id.split("://")
         for guid in item.guids
@@ -53,7 +53,7 @@ def extract_guids_from_item(item: Union[Movie, Episode]) -> Dict[str, str]:
     return guids
 
 
-def get_guids(item: Union[Movie, Episode], completed=True):
+async def get_guids(item: Union[Movie, Episode], completed=True):
     return {
         "title": item.title,
         "locations": tuple([location.split("/")[-1] for location in item.locations]),
@@ -61,12 +61,12 @@ def get_guids(item: Union[Movie, Episode], completed=True):
             "completed": completed,
             "time": item.viewOffset,
         },
-    } | extract_guids_from_item(
+    } | await extract_guids_from_item(
         item
     )  # Merge the metadata and guid dictionaries
 
 
-def get_user_library_watched_show(show):
+async def get_user_library_watched_show(show):
     try:
         show_guids: FrozenSet = frozenset(
             (
@@ -76,7 +76,7 @@ def get_user_library_watched_show(show):
                         [location.split("/")[-1] for location in show.locations]
                     ),
                 }
-                | extract_guids_from_item(show)
+                | await extract_guids_from_item(show)
             ).items()  # Merge the metadata and guid dictionaries
         )
 
@@ -90,7 +90,7 @@ def get_user_library_watched_show(show):
                 [
                     (
                         episode.parentIndex,
-                        get_guids(episode, completed=episode in watched_episodes),
+                        await get_guids(episode, completed=episode in watched_episodes),
                     )
                     for episode in show.episodes()
                     # Only include watched or partially-watched more than a minute episodes
@@ -105,7 +105,7 @@ def get_user_library_watched_show(show):
         return {}, {}
 
 
-def get_user_library_watched(user, user_plex, library):
+async def get_user_library_watched(user, user_plex, library):
     user_name: str = user.title.lower()
     try:
         logger(
@@ -115,38 +115,42 @@ def get_user_library_watched(user, user_plex, library):
 
         library_videos = user_plex.library.section(library.title)
 
+        process_tasks = []
+
         if library.type == "movie":
             watched = []
+            
+            for video in library_videos.search(unwatched=False):
+                process_tasks.append(
+                    asyncio.ensure_future(get_guids(video, True))
+                )
+            for video in library_videos.search(inProgress=True):
+                if video.viewOffset >= 60000:
+                    process_tasks.append(
+                        asyncio.ensure_future(get_guids(video, False))
+                    )
+                
+            videos = await asyncio.gather(*process_tasks)
 
-            args = [
-                [get_guids, video, True]
-                for video
-                # Get all watched movies
-                in library_videos.search(unwatched=False)
-            ] + [
-                [get_guids, video, False]
-                for video
-                # Get all partially watched movies
-                in library_videos.search(inProgress=True)
-                # Only include partially-watched movies more than a minute
-                if video.viewOffset >= 60000
-            ]
+            for video in videos:
+                watched.append(video)
 
-            for guid in future_thread_executor(args, threads=min(os.cpu_count(), 4)):
-                logger(f"Plex: Adding {guid['title']} to {user_name} watched list", 3)
-                watched.append(guid)
+
         elif library.type == "show":
             watched = {}
 
             # Get all watched shows and partially watched shows
-            args = [
-                (get_user_library_watched_show, show)
-                for show in library_videos.search(unwatched=False)
-                + library_videos.search(inProgress=True)
-            ]
+            
+            for show in library_videos.search(unwatched=False) + library_videos.search(inProgress=True):
+                process_tasks.append(
+                    asyncio.ensure_future(get_user_library_watched_show(show))
+                )
 
-            for show_guids, episode_guids in future_thread_executor(args, threads=4):
-                if show_guids and episode_guids:
+            shows_watched = await asyncio.gather(*process_tasks)
+
+            for show_watched in shows_watched:
+                if show_watched:
+                    show_guids, episode_guids = show_watched
                     watched[show_guids] = episode_guids
                     logger(
                         f"Plex: Added {episode_guids} to {user_name} {show_guids} watched list",
@@ -165,6 +169,55 @@ def get_user_library_watched(user, user_plex, library):
             2,
         )
         return {}
+
+
+async def get_watched_libraries(users, users_list, blacklist_library, whitelist_library, blacklist_library_type, whitelist_library_type, library_mapping):
+    users_watched = {}
+
+    library_tasks = []
+
+    for i, user_plex in enumerate(users_list):
+        user = users[i]
+        libraries = user_plex.library.sections()
+
+        for library in libraries:
+            library_title = library.title
+            library_type = library.type
+
+            skip_reason = check_skip_logic(
+                library_title,
+                library_type,
+                blacklist_library,
+                whitelist_library,
+                blacklist_library_type,
+                whitelist_library_type,
+                library_mapping,
+            )
+
+            if skip_reason:
+                logger(
+                    f"Plex: Skipping library {library_title}: {skip_reason}", 1
+                )
+                continue
+
+            library_tasks.append(
+                asyncio.ensure_future(
+                    get_user_library_watched(user, user_plex, library)
+                )
+            )
+
+    libraries_watched = await asyncio.gather(*library_tasks)
+
+    for library_watched in libraries_watched:
+        if library_watched:
+            if user.title.lower() not in users_watched.keys():
+                users_watched[user.title.lower()] = {}
+            
+            users_watched[user.title.lower()].update(library_watched[user.title.lower()])
+        
+        
+
+    return users_watched
 
 
 def find_video(plex_search, video_ids, videos=None):
@@ -432,7 +485,7 @@ class Plex:
         try:
             # Get all libraries
             users_watched = {}
-            args = []
+            users_list = []
 
             for user in users:
                 if self.admin_user == user:
@@ -452,35 +505,21 @@ class Plex:
                         users_watched[user.title] = {}
                         continue
 
-                libraries = user_plex.library.sections()
+                users_list.append(user_plex)
+            
+            
 
-                for library in libraries:
-                    library_title = library.title
-                    library_type = library.type
-
-                    skip_reason = check_skip_logic(
-                        library_title,
-                        library_type,
-                        blacklist_library,
-                        whitelist_library,
-                        blacklist_library_type,
-                        whitelist_library_type,
-                        library_mapping,
-                    )
-
-                    if skip_reason:
-                        logger(
-                            f"Plex: Skipping library {library_title}: {skip_reason}", 1
-                        )
-                        continue
-
-                    args.append([get_user_library_watched, user, user_plex, library])
-
-            for user_watched in future_thread_executor(args):
-                for user, user_watched_temp in user_watched.items():
-                    if user not in users_watched:
-                        users_watched[user] = {}
-                    users_watched[user].update(user_watched_temp)
+            users_watched = asyncio.run(
+                get_watched_libraries(
+                    users,
+                    users_list,
+                    blacklist_library,
+                    whitelist_library,
+                    blacklist_library_type,
+                    whitelist_library_type,
+                    library_mapping,
+                )
+            )
 
             return users_watched
         except Exception as e:
