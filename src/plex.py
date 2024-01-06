@@ -210,10 +210,11 @@ async def get_watched_libraries(users, users_list, blacklist_library, whitelist_
 
     for library_watched in libraries_watched:
         if library_watched:
-            if user.title.lower() not in users_watched.keys():
-                users_watched[user.title.lower()] = {}
+            user = list(library_watched.keys())[0]
+            if user not in users_watched.keys():
+                users_watched[user] = {}
             
-            users_watched[user.title.lower()].update(library_watched[user.title.lower()])
+            users_watched[user].update(library_watched[user])
         
         
 
