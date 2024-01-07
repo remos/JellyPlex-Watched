@@ -1,4 +1,5 @@
 import re, requests, os, traceback, asyncio
+from time import perf_counter_ns
 from typing import Dict, Union, FrozenSet
 import operator
 from itertools import groupby as itertools_groupby
@@ -8,7 +9,7 @@ from math import floor
 
 from requests.adapters import HTTPAdapter as RequestsHTTPAdapter
 
-from plexapi.video import Episode, Movie
+from plexapi.video import Show, Episode, Movie
 from plexapi.server import PlexServer
 from plexapi.myplex import MyPlexAccount
 
@@ -24,6 +25,13 @@ from src.library import (
     generate_library_guids_dict,
 )
 
+extract_guids_from_item_times = []
+show_guids_times = []
+episode_guids_times = []
+watched_times = []
+show_search_times = []
+show_watched_times = []
+
 
 # Bypass hostname validation for ssl. Taken from https://github.com/pkkid/python-plexapi/issues/143#issuecomment-775485186
 class HostNameIgnoringAdapter(RequestsHTTPAdapter):
@@ -37,19 +45,11 @@ class HostNameIgnoringAdapter(RequestsHTTPAdapter):
         )
 
 
-async def extract_guids_from_item(item: Union[Movie, Episode]) -> Dict[str, str]:
-    guids: Dict[str, str] = dict(
-        guid.id.split("://")
-        for guid in item.guids
-        if guid.id is not None and len(guid.id.strip()) > 0
-    )
+async def extract_guids_from_item(item: Union[Movie, Show, Episode]) -> Dict[str, str]:
+    start = perf_counter_ns()
+    guids: Dict[str, str] = dict(guid.id.split("://") for guid in item.guids if guid.id)
 
-    if len(guids) == 0:
-        logger(
-            f"Plex: Failed to get any guids for {item.title}, Using location only",
-            1,
-        )
-
+    extract_guids_from_item_times.append(perf_counter_ns() - start)
     return guids
 
 
@@ -68,7 +68,8 @@ async def get_guids(item: Union[Movie, Episode], completed=True):
 
 async def get_user_library_watched_show(show):
     try:
-        show_guids: FrozenSet = frozenset(
+        start = perf_counter_ns()
+        show_guids = frozenset(
             (
                 {
                     "title": show.title,
@@ -77,28 +78,35 @@ async def get_user_library_watched_show(show):
                     ),
                 }
                 | await extract_guids_from_item(show)
-            ).items()  # Merge the metadata and guid dictionaries
+            ).items()
         )
+        show_guids_times.append(perf_counter_ns() - start)
 
-        watched_episodes = show.watched()
+        start = perf_counter_ns()
+        allepisodes = show.episodes()
+
+        async def get_episode_guids(episode):
+            return (
+                episode.parentIndex,
+                await get_guids(episode, completed=episode.isWatched),
+            )
+
+        episodes_to_process = [
+            episode
+            for episode in allepisodes
+            if episode.isWatched or episode.viewOffset >= 60000
+        ]
+
         episode_guids = {
-            # Offset group data because the first value will be the key
             season: [episode[1] for episode in episodes]
-            for season, episodes
-            # Group episodes by first element of tuple (episode.parentIndex)
-            in itertools_groupby(
-                [
-                    (
-                        episode.parentIndex,
-                        await get_guids(episode, completed=episode in watched_episodes),
-                    )
-                    for episode in show.episodes()
-                    # Only include watched or partially-watched more than a minute episodes
-                    if episode in watched_episodes or episode.viewOffset >= 60000
-                ],
+            for season, episodes in itertools_groupby(
+                await asyncio.gather(
+                    *(get_episode_guids(episode) for episode in episodes_to_process)
+                ),
                 operator.itemgetter(0),
             )
         }
+        episode_guids_times.append(perf_counter_ns() - start)
 
         return show_guids, episode_guids
     except Exception:
@@ -119,35 +127,34 @@ async def get_user_library_watched(user, user_plex, library):
 
         if library.type == "movie":
             watched = []
-            
+
             for video in library_videos.search(unwatched=False):
-                process_tasks.append(
-                    asyncio.ensure_future(get_guids(video, True))
-                )
+                process_tasks.append(asyncio.ensure_future(get_guids(video, True)))
             for video in library_videos.search(inProgress=True):
                 if video.viewOffset >= 60000:
-                    process_tasks.append(
-                        asyncio.ensure_future(get_guids(video, False))
-                    )
-                
+                    process_tasks.append(asyncio.ensure_future(get_guids(video, False)))
+
             videos = await asyncio.gather(*process_tasks)
 
             for video in videos:
                 watched.append(video)
 
-
         elif library.type == "show":
             watched = {}
 
             # Get all watched shows and partially watched shows
-            
-            for show in library_videos.search(unwatched=False) + library_videos.search(inProgress=True):
+            start = perf_counter_ns()
+            search_start = perf_counter_ns()
+            for show in library_videos.search(unwatched=False):
                 process_tasks.append(
                     asyncio.ensure_future(get_user_library_watched_show(show))
                 )
+                show_search_times.append(perf_counter_ns() - search_start)
+                search_start = perf_counter_ns()
 
             shows_watched = await asyncio.gather(*process_tasks)
 
+            show_watched_times.append(perf_counter_ns() - start)
             for show_watched in shows_watched:
                 if show_watched:
                     show_guids, episode_guids = show_watched
@@ -171,7 +178,15 @@ async def get_user_library_watched(user, user_plex, library):
         return {}
 
 
-async def get_watched_libraries(users, users_list, blacklist_library, whitelist_library, blacklist_library_type, whitelist_library_type, library_mapping):
+async def get_watched_libraries(
+    users,
+    users_list,
+    blacklist_library,
+    whitelist_library,
+    blacklist_library_type,
+    whitelist_library_type,
+    library_mapping,
+):
     users_watched = {}
 
     library_tasks = []
@@ -195,9 +210,7 @@ async def get_watched_libraries(users, users_list, blacklist_library, whitelist_
             )
 
             if skip_reason:
-                logger(
-                    f"Plex: Skipping library {library_title}: {skip_reason}", 1
-                )
+                logger(f"Plex: Skipping library {library_title}: {skip_reason}", 1)
                 continue
 
             library_tasks.append(
@@ -213,10 +226,8 @@ async def get_watched_libraries(users, users_list, blacklist_library, whitelist_
             user = list(library_watched.keys())[0]
             if user not in users_watched.keys():
                 users_watched[user] = {}
-            
+
             users_watched[user].update(library_watched[user])
-        
-        
 
     return users_watched
 
@@ -507,8 +518,6 @@ class Plex:
                         continue
 
                 users_list.append(user_plex)
-            
-            
 
             users_watched = asyncio.run(
                 get_watched_libraries(
@@ -520,6 +529,49 @@ class Plex:
                     whitelist_library_type,
                     library_mapping,
                 )
+            )
+
+            # seconds min, max and average
+            # extract_guids_from_item_times, show_guids_times, episode_guids_times, watched_times, show_search_times, show_watched_times
+            logger(
+                f"Plex: extract_guids_from_item_times:\
+                    \n\tmin: {min(extract_guids_from_item_times) / 1000000000} \
+                    \n\tmax: {max(extract_guids_from_item_times) / 1000000000} \
+                    \n\tavg: {sum(extract_guids_from_item_times) / len(extract_guids_from_item_times) / 1000000000} \
+                    \n\ttotal: {sum(extract_guids_from_item_times) / 1000000000}",
+                0,
+            )
+            logger(
+                f"Plex: show_guids_times:\
+                    \n\tmin: {min(show_guids_times) / 1000000000} \
+                    \n\tmax: {max(show_guids_times) / 1000000000} \
+                    \n\tavg: {sum(show_guids_times) / len(show_guids_times) / 1000000000} \
+                    \n\ttotal: {sum(show_guids_times) / 1000000000}",
+                0,
+            )
+            logger(
+                f"Plex: episode_guids_times: \
+                    \n\tmin: {min(episode_guids_times) / 1000000000} \
+                    \n\tmax: {max(episode_guids_times) / 1000000000} \
+                    \n\tavg: {sum(episode_guids_times) / len(episode_guids_times) / 1000000000} \
+                    \n\ttotal: {sum(episode_guids_times) / 1000000000}",
+                0,
+            )
+            logger(
+                f"Plex: show_search_times: \
+                    \n\tmin: {min(show_search_times) / 1000000000} \
+                    \n\tmax: {max(show_search_times) / 1000000000} \
+                    \n\tavg: {sum(show_search_times) / len(show_search_times) / 1000000000} \
+                    \n\ttotal: {sum(show_search_times) / 1000000000}",
+                0,
+            )
+            logger(
+                f"Plex: show_watched_times: \
+                    \n\tmin: {min(show_watched_times) / 1000000000} \
+                    \n\tmax: {max(show_watched_times) / 1000000000} \
+                    \n\tavg: {sum(show_watched_times) / len(show_watched_times) / 1000000000} \
+                    \n\ttotal: {sum(show_watched_times) / 1000000000}",
+                0,
             )
 
             return users_watched
